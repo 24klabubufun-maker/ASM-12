@@ -1,12 +1,15 @@
 /* ASM editor. Requires app.js (loaded first).
 
-   HOW SAVING WORKS (GitHub Pages is static, so a browser cannot write to your repository):
-   1. Every change is kept as a draft in THIS browser (localStorage) so you don't lose work.
-   2. Click "Export library.json" to download the complete updated data file.
-   3. Replace data/library.json in your GitHub repository with that file and commit.
-      The public site updates after GitHub Pages rebuilds (usually within a minute or two).
-   No passwords or tokens are used anywhere. Anyone can open this page, but their edits
-   only exist in their own browser; nothing changes on the site unless you commit a file. */
+   HOW SAVING WORKS: the editor commits data/library.json straight into your GitHub repository
+   using GitHub's own API (github.com), directly from the browser. There is no server of ours.
+   1. Enter your owner/repository and a fine-grained personal access token (Contents: read & write
+      on this one repository). The token is typed in at runtime and kept only in this browser;
+      it is NEVER part of the website's files.
+   2. Click "Save to GitHub". GitHub stores the commit, GitHub Pages republishes the site
+      (usually 1-2 minutes) and every device then sees the new data.
+   Without the token nobody can change the site: visitors who open this page can only edit
+   their own browser's draft. Unsaved changes are kept as a draft in this browser (localStorage).
+   "Download library.json" / "Import" remain as a manual backup route. */
 
 const KEY = 'asm-draft-v1';
 const TYPES = { heading: 'Heading', paragraph: 'Paragraph', bullets: 'Bullet list', numbered: 'Numbered list', table: 'Table', note: 'Important note', example: 'Example', image: 'Image', formula: 'Formula / equation' };
@@ -105,34 +108,116 @@ function exp() {
   setTimeout(() => URL.revokeObjectURL(u), 1000);
 }
 
+/* ---------- GitHub connection ---------- */
+const CFG = 'asm-gh', TK = 'asm-gh-token';
+const seg = location.pathname.split('/')[1] || '';
+const onPages = location.hostname.endsWith('.github.io');
+const cfg = { owner: onPages ? location.hostname.split('.')[0] : '', repo: onPages ? (seg && !seg.includes('.') ? seg : location.hostname) : '', branch: '', path: 'data/library.json', remember: false };
+try { Object.assign(cfg, JSON.parse(localStorage.getItem(CFG) || '{}')); } catch (e) { }
+const getToken = () => { try { return sessionStorage.getItem(TK) || localStorage.getItem(TK) || ''; } catch (e) { return ''; } };
+let tokenVal = getToken(), loadedSha = null;
+
+function remember() {
+  try {
+    localStorage.setItem(CFG, JSON.stringify(cfg));
+    sessionStorage.removeItem(TK); localStorage.removeItem(TK);
+    if (tokenVal) (cfg.remember ? localStorage : sessionStorage).setItem(TK, tokenVal);
+  } catch (e) { }
+}
+const b64 = s => { const u = new TextEncoder().encode(s); let x = ''; for (let i = 0; i < u.length; i += 8192) x += String.fromCharCode(...u.subarray(i, i + 8192)); return btoa(x); };
+
+async function gh(method, accept, body) {
+  if (!cfg.owner || !cfg.repo || !cfg.path) throw new Error('Fill in owner, repository and data file path.');
+  const url = 'https://api.github.com/repos/' + enc(cfg.owner) + '/' + enc(cfg.repo) + '/contents/' + cfg.path.split('/').map(enc).join('/') + (method === 'GET' && cfg.branch ? '?ref=' + enc(cfg.branch) : '');
+  const h = { Accept: accept, 'X-GitHub-Api-Version': '2022-11-28' };
+  if (tokenVal) h.Authorization = 'Bearer ' + tokenVal;
+  if (body) h['Content-Type'] = 'application/json';
+  return fetch(url, { method, headers: h, body: body && JSON.stringify(body), cache: 'no-store' });
+}
+async function fail(r) {
+  let m = ''; try { m = (await r.json()).message; } catch (e) { }
+  const why = {
+    401: 'the token was rejected (wrong or expired)',
+    403: 'not allowed: the token needs Contents read and write permission on this repository (or a rate limit was hit)',
+    404: 'not found: check owner, repository, branch and file path, and that the token can access the repository',
+    409: 'the file changed on GitHub while saving; use Load from GitHub and try again',
+    422: 'GitHub refused the update (check the branch name)'
+  }[r.status] || 'unexpected response';
+  return new Error('GitHub says HTTP ' + r.status + ': ' + why + (m ? ' (' + m + ')' : ''));
+}
+async function pull() {
+  const j = await gh('GET', 'application/vnd.github+json'); if (!j.ok) throw await fail(j);
+  const sha = (await j.json()).sha;
+  const r = await gh('GET', 'application/vnd.github.raw+json'); if (!r.ok) throw await fail(r);
+  D = norm(JSON.parse(await r.text())); loadedSha = sha; sel = { s: null, t: null };
+}
+async function loadGH() {
+  if (drafted && !confirm('Replace your unsaved changes with the version on GitHub?')) return;
+  remember(); msg = 'Loading from GitHub...'; draw();
+  try { await pull(); try { localStorage.removeItem(KEY); } catch (e) { } drafted = false; msg = 'Loaded the current file from GitHub.'; }
+  catch (e) { msg = 'Load failed: ' + e.message; }
+  draw();
+}
+async function saveGH() {
+  const bad = check();
+  if (bad.length && !confirm('Problems found:\n' + bad.join('\n') + '\n\nSave anyway?')) return;
+  remember();
+  if (!tokenVal) { msg = 'Enter your GitHub token first (see README.md).'; return draw(); }
+  msg = 'Saving to GitHub...'; draw();
+  try {
+    const g = await gh('GET', 'application/vnd.github+json');
+    let sha;
+    if (g.ok) sha = (await g.json()).sha; else if (g.status !== 404) throw await fail(g);
+    if (sha && loadedSha && sha !== loadedSha && !confirm('The file on GitHub has changed since you loaded it (maybe saved from another device). Overwrite it with your version?')) { msg = 'Save cancelled.'; return draw(); }
+    const body = { message: 'Update study library via ASM editor', content: b64(JSON.stringify(D, null, 2) + '\n'), sha };
+    if (cfg.branch) body.branch = cfg.branch;
+    const p = await gh('PUT', 'application/vnd.github+json', body);
+    if (!p.ok) throw await fail(p);
+    loadedSha = (await p.json()).content.sha;
+    try { localStorage.removeItem(KEY); } catch (e) { }
+    drafted = false;
+    msg = 'Saved to GitHub at ' + new Date().toLocaleTimeString() + '. GitHub Pages usually needs 1-2 minutes to publish it to the site.';
+  } catch (e) { msg = 'Save failed: ' + e.message; }
+  draw();
+}
 async function reset() {
-  if (!confirm('Discard all unexported changes and reload data/library.json from the site?')) return;
+  if (!confirm('Discard all unsaved changes and reload the saved version?')) return;
   try { localStorage.removeItem(KEY); } catch (e) { }
   drafted = false; msg = '';
-  try { D = await loadData(); } catch (e) { D = { subjects: [] }; msg = e.message; }
+  try { await pull(); } catch (e) { try { D = await loadData(); } catch (e2) { D = { subjects: [] }; msg = e2.message; } }
   sel = { s: null, t: null }; draw();
 }
+
+const cf = (k, label, size) => $('p', {}, $('label', {}, label + ': ', $('input', { size, value: cfg[k], oninput: e => { cfg[k] = e.target.value.trim(); } })));
+const connUI = () => $('fieldset', {}, $('legend', {}, 'GitHub connection (needed to save to the website)'),
+  cf('owner', 'Owner (your GitHub username)', 30), cf('repo', 'Repository name', 30),
+  cf('branch', 'Branch (blank = default branch)', 20), cf('path', 'Data file path', 30),
+  $('p', {}, $('label', {}, 'Access token: ', $('input', { type: 'password', size: 40, value: tokenVal, autocomplete: 'off', oninput: e => { tokenVal = e.target.value.trim(); } }))),
+  $('p', {}, $('label', {}, $('input', { type: 'checkbox', checked: cfg.remember, onchange: e => { cfg.remember = e.target.checked; } }), ' Remember the token on this device (leave unticked on shared computers)')),
+  $('p', {}, 'Use a fine-grained token limited to this one repository with "Contents: Read and write" (see README.md). It is kept only in this browser, never in the site files.'));
 
 function toolbar() {
   const f = $('input', {
     type: 'file', accept: '.json,application/json', onchange: async () => {
-      try { D = norm(JSON.parse(await f.files[0].text())); sel = { s: null, t: null }; msg = 'Imported.'; change(); }
+      try { D = norm(JSON.parse(await f.files[0].text())); sel = { s: null, t: null }; msg = 'Imported (not saved yet).'; change(); }
       catch (e) { alert('Import failed: ' + e.message); }
     }
   });
-  return $('p', {}, $('button', { type: 'button', onclick: exp }, 'Export library.json'), ' ',
-    $('label', {}, 'Import a library.json: ', f), ' ',
-    $('button', { type: 'button', onclick: reset }, 'Discard draft and reload from site'));
+  return $('div', {},
+    $('p', {}, $('button', { type: 'button', onclick: saveGH }, 'Save to GitHub'), ' ',
+      $('button', { type: 'button', onclick: loadGH }, 'Load from GitHub'), ' ',
+      $('button', { type: 'button', onclick: reset }, 'Discard unsaved changes')),
+    $('p', {}, 'Backup: ', $('button', { type: 'button', onclick: exp }, 'Download library.json'), ' ',
+      $('label', {}, 'Import a library.json: ', f)));
 }
 
 function draw() {
   const y = scrollY;
   const S = D.subjects.find(x => x.id === sel.s), T = S && S.topics.find(x => x.id === sel.t);
   root().replaceChildren(nav(), $('hr'), $('h1', {}, 'ASM Editor'),
-    $('p', {}, drafted ? 'Working from a draft saved in this browser.' : 'Working from data/library.json.',
-      ' The public site only changes after you export library.json and commit it to GitHub (see README.md).'),
+    $('p', {}, drafted ? 'You have unsaved changes (kept in this browser until you click Save to GitHub).' : 'No unsaved changes.'),
     msg ? $('p', {}, $('b', {}, msg)) : null,
-    toolbar(), $('hr'),
+    toolbar(), connUI(), $('hr'),
     $('h2', {}, 'Subjects'),
     nameList(D.subjects, 'subject', sel.s, o => { sel = { s: o.id, t: null }; draw(); }),
     addNamed(D.subjects, 'subject', n => ({ id: uid(), name: n, topics: [] })),
@@ -144,7 +229,10 @@ function draw() {
 }
 
 (async () => {
-  try { const s = localStorage.getItem(KEY); if (s) { D = norm(JSON.parse(s)); drafted = true; } } catch (e) { }
-  if (!drafted) { try { D = await loadData(); } catch (e) { msg = e.message + ' Starting empty; you can Import a library.json.'; } }
+  try { const s = localStorage.getItem(KEY); if (s) { D = norm(JSON.parse(s)); drafted = true; msg = 'Restored your unsaved changes.'; } } catch (e) { }
+  if (!drafted) {
+    try { await pull(); }
+    catch (e) { try { D = await loadData(); } catch (e2) { msg = e2.message + ' Starting empty; fill in the GitHub connection and Load, or Import a library.json.'; } }
+  }
   draw();
 })();
